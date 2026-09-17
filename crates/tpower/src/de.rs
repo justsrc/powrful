@@ -88,7 +88,7 @@ with_repr! {
         pub amperage: i32,
         pub voltage: i32,
         pub apple_raw_battery_voltage: Option<i32>,
-        pub apple_raw_current_capacity: i32,
+        pub apple_raw_current_capacity: Option<i32>,
         pub apple_raw_max_capacity: i32,
         pub current_capacity: i32,
         pub cycle_count: i32,
@@ -202,12 +202,31 @@ mod tests {
     }
 
     #[test]
+    fn ioregistry_preserves_raw_current_capacity_presence() {
+        for (entries, expected) in [
+            ("", None),
+            (
+                "<key>AppleRawCurrentCapacity</key><integer>0</integer>",
+                Some(0),
+            ),
+        ] {
+            let source = parse_registry(entries).unwrap();
+            assert_eq!(source.apple_raw_current_capacity, expected);
+            assert_eq!(
+                IORegistry::from(source).apple_raw_current_capacity,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn ioregistry_rejects_malformed_types() {
         for entries in [
             "<key>Voltage</key><string>12000</string>",
             "<key>IsCharging</key><integer>1</integer>",
             "<key>UpdateTime</key><string>123</string>",
             "<key>AppleRawBatteryVoltage</key><string>12000</string>",
+            "<key>AppleRawCurrentCapacity</key><string>0</string>",
             "<key>AdapterDetails</key><string>adapter</string>",
             "<key>AdapterDetails</key><dict><key>Watts</key><string>96</string></dict>",
             "<key>AdapterDetails</key><dict><key>IsWireless</key><integer>1</integer></dict>",
@@ -286,7 +305,7 @@ mod tests {
         assert_eq!(converted.amperage, -1202);
         assert_eq!(converted.voltage, 12003);
         assert_eq!(converted.apple_raw_battery_voltage, Some(12004));
-        assert_eq!(converted.apple_raw_current_capacity, 4205);
+        assert_eq!(converted.apple_raw_current_capacity, Some(4205));
         assert_eq!(converted.apple_raw_max_capacity, 5106);
         assert_eq!(converted.current_capacity, 87);
         assert_eq!(converted.cycle_count, 208);

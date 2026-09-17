@@ -131,7 +131,9 @@ fn resolved_capacities(io: &IORegistry) -> ResolvedCapacities {
     let current = battery
         .and_then(|data| data.remaining_capacity)
         .filter(|&capacity| capacity >= 0)
-        .or((io.apple_raw_current_capacity > 0).then_some(io.apple_raw_current_capacity));
+        .or(io
+            .apple_raw_current_capacity
+            .filter(|&capacity| capacity >= 0));
     let max = battery
         .and_then(|data| data.full_charge_capacity)
         .filter(|&capacity| capacity > 0)
@@ -401,6 +403,30 @@ mod tests {
             Some((Some(8322), Some(8694), None)),
             (None, 8322, 8694, 73.),
         );
+    }
+
+    #[test]
+    fn explicit_legacy_zero_capacity_is_preserved() {
+        assert_capacity_normalizations(
+            "<key>AppleRawCurrentCapacity</key><integer>0</integer>
+             <key>AppleRawMaxCapacity</key><integer>5000</integer>",
+            None,
+            (Some(0), 5000, 0, 0.),
+        );
+    }
+
+    #[test]
+    fn missing_or_negative_legacy_current_capacity_is_unavailable() {
+        for entries in [
+            "",
+            "<key>AppleRawCurrentCapacity</key><integer>-1</integer>",
+        ] {
+            assert_capacity_normalizations(
+                &format!("<key>AppleRawMaxCapacity</key><integer>5000</integer>{entries}"),
+                None,
+                (None, 5000, 0, 73.),
+            );
+        }
     }
 
     #[test]
