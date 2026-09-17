@@ -2,6 +2,21 @@
 import { Battery, CloudLightning, Cpu, Thermometer } from 'lucide-vue-next'
 
 const power = usePower()
+
+const hasMaxCapacity = computed(() => Number.isFinite(power.value.maxCapacity) && power.value.maxCapacity > 0)
+const batteryHealth = computed(() => {
+  const designCapacity = power.value.designCapacity
+  if (!hasMaxCapacity.value || designCapacity == null || !Number.isFinite(designCapacity) || designCapacity <= 0)
+    return '—'
+
+  return `${Math.min(power.value.maxCapacity / designCapacity * 100, 100).toFixed(1)}%`
+})
+const currentCapacity = computed(() => {
+  if (!hasMaxCapacity.value || !Number.isFinite(power.value.currentCapacity) || power.value.currentCapacity < 0)
+    return '—'
+
+  return `${power.value.currentCapacity}mAh`
+})
 </script>
 
 <template>
@@ -32,8 +47,7 @@ const power = usePower()
       </CardHeader>
       <CardContent>
         <div v-if="!power.isLoading" class="text-2xl font-bold">
-          <!-- TODO: typing -->
-          {{ (power.maxCapacity / power.designCapacity! * 100).toFixed(1) }}%
+          {{ batteryHealth }}
         </div>
         <Skeleton v-else class="w-12 h-8" />
         <p class="text-xs text-muted-foreground">
@@ -67,13 +81,13 @@ const power = usePower()
       </CardHeader>
       <CardContent>
         <div v-if="!power.isLoading" class="text-2xl font-bold">
-          {{ power.currentCapacity }}mAh
+          {{ currentCapacity }}
         </div>
         <Skeleton v-else class="w-12 h-8" />
         <p class="flex gap-2 text-xs text-muted-foreground">
           Max Capacity: <span v-if="!power.isLoading">{{
-            power.maxCapacity
-          }}mAh</span>
+            hasMaxCapacity ? `${power.maxCapacity}mAh` : '—'
+          }}</span>
           <Skeleton v-else class="w-12 h-4" />
         </p>
       </CardContent>
