@@ -55,6 +55,21 @@ pub struct PowerTickEvent {
     pub data: NormalizedResource,
 }
 
+fn emit_power_tick<R: Runtime>(app: &tauri::AppHandle<R>, smc: &SMCPowerData) {
+    match get_mac_ioreg() {
+        Ok(ioreg) => {
+            if let Err(error) = (PowerTickEvent {
+                data: (&ioreg, smc).into(),
+            })
+            .emit(app)
+            {
+                log::error!("failed to emit power telemetry: {error}");
+            }
+        }
+        Err(error) => log::error!("failed to read power telemetry: {error}"),
+    }
+}
+
 pub fn start_sender<R: Runtime>(
     app: &impl Manager<R>,
     mut rx: mpsc::Receiver<SenderMessage>,
@@ -83,20 +98,16 @@ pub fn start_sender<R: Runtime>(
                     let smc = smc_conn.read_sensor();
                     PowerUpdatedEvent::new_with(&smc, &status_bar_item, show_charging)
                         .emit(&app)
-                        .unwrap();
-                    PowerTickEvent {
-                        data: (&get_mac_ioreg().unwrap(), &smc).into(),
-                    }.emit(&app).unwrap();
+                        .unwrap_or_else(|error| log::error!("failed to emit power update: {error}"));
+                    emit_power_tick(&app, &smc);
                 }
                 Some(msg) = rx.recv() => match msg {
                     SenderMessage::ImmediateSend => {
                         let smc = smc_conn.read_sensor();
                         PowerUpdatedEvent::new_with(&smc, &status_bar_item, show_charging)
                             .emit(&app)
-                            .unwrap();
-                        PowerTickEvent {
-                            data:  (&get_mac_ioreg().unwrap(), &smc).into()
-                        }.emit(&app).unwrap();
+                            .unwrap_or_else(|error| log::error!("failed to emit power update: {error}"));
+                        emit_power_tick(&app, &smc);
                     },
                     SenderMessage::ChangeInterval(interval) => {
                         timer = time::interval(if interval < Duration::from_millis(500) {
@@ -110,13 +121,13 @@ pub fn start_sender<R: Runtime>(
                         status_bar_item = item;
                         PowerUpdatedEvent::new_with(&smc_conn.read_sensor(), &status_bar_item, show_charging)
                             .emit(&app)
-                            .unwrap();
+                            .unwrap_or_else(|error| log::error!("failed to emit power update: {error}"));
                     },
                     SenderMessage::StatusBarShowCharging(show) => {
                         show_charging = show;
                         PowerUpdatedEvent::new_with(&smc_conn.read_sensor(), &status_bar_item, show_charging)
                             .emit(&app)
-                            .unwrap();
+                            .unwrap_or_else(|error| log::error!("failed to emit power update: {error}"));
                     }
                 }
             }
