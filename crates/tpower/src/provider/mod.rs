@@ -37,7 +37,7 @@ pub struct NormalizedResource {
     pub last_update: i64,
     pub adapter_name: Option<String>,
     pub cycle_count: i32,
-    pub current_capacity: i32,
+    pub current_capacity: Option<i32>,
     pub max_capacity: i32,
     #[serde(default)]
     pub design_capacity: i32,
@@ -120,7 +120,7 @@ impl Deref for NormalizedResource {
 }
 
 struct ResolvedCapacities {
-    current: i32,
+    current: Option<i32>,
     max: i32,
     design: i32,
     percentage: f32,
@@ -131,7 +131,7 @@ fn resolved_capacities(io: &IORegistry) -> ResolvedCapacities {
     let current = battery
         .and_then(|data| data.remaining_capacity)
         .filter(|&capacity| capacity >= 0)
-        .unwrap_or(io.apple_raw_current_capacity);
+        .or((io.apple_raw_current_capacity > 0).then_some(io.apple_raw_current_capacity));
     let max = battery
         .and_then(|data| data.full_charge_capacity)
         .filter(|&capacity| capacity > 0)
@@ -140,10 +140,9 @@ fn resolved_capacities(io: &IORegistry) -> ResolvedCapacities {
         .and_then(|data| data.design_capacity)
         .filter(|&capacity| capacity > 0)
         .unwrap_or(io.design_capacity);
-    let percentage = if max > 0 {
-        current as f32 / max as f32 * 100.
-    } else {
-        io.current_capacity as f32
+    let percentage = match current {
+        Some(current) if max > 0 => current as f32 / max as f32 * 100.,
+        _ => io.current_capacity as f32,
     };
 
     ResolvedCapacities {
@@ -299,7 +298,7 @@ mod tests {
     fn assert_capacity_normalizations(
         entries: &str,
         nested: Option<(Option<i32>, Option<i32>, Option<i32>)>,
-        expected: (i32, i32, i32, f32),
+        expected: (Option<i32>, i32, i32, f32),
     ) {
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -354,13 +353,13 @@ mod tests {
                 <key>NominalChargeCapacity</key><integer>8200</integer>
             </dict>",
             Some((Some(8322), Some(8694), Some(7623))),
-            (7623, 8322, 8694, 7623. / 8322. * 100.),
+            (Some(7623), 8322, 8694, 7623. / 8322. * 100.),
         );
     }
 
     #[test]
     fn legacy_capacities_without_battery_data() {
-        assert_capacity_normalizations(LEGACY_CAPACITIES, None, (4000, 5000, 6000, 80.));
+        assert_capacity_normalizations(LEGACY_CAPACITIES, None, (Some(4000), 5000, 6000, 80.));
     }
 
     #[test]
@@ -369,19 +368,19 @@ mod tests {
             (
                 "<key>FullChargeCapacity</key><integer>8322</integer>",
                 (Some(8322), None, None),
-                (4000, 8322, 6000, 4000. / 8322. * 100.),
+                (Some(4000), 8322, 6000, 4000. / 8322. * 100.),
             ),
             (
                 "<key>DesignCapacity</key><integer>8694</integer>",
                 (None, Some(8694), None),
-                (4000, 5000, 8694, 80.),
+                (Some(4000), 5000, 8694, 80.),
             ),
             (
                 "<key>RemainingCapacity</key><integer>7623</integer>",
                 (None, None, Some(7623)),
-                (7623, 5000, 6000, 7623. / 5000. * 100.),
+                (Some(7623), 5000, 6000, 7623. / 5000. * 100.),
             ),
-            ("", (None, None, None), (4000, 5000, 6000, 80.)),
+            ("", (None, None, None), (Some(4000), 5000, 6000, 80.)),
         ] {
             assert_capacity_normalizations(
                 &format!("{LEGACY_CAPACITIES}<key>BatteryData</key><dict>{entries}</dict>"),
@@ -389,6 +388,19 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn missing_current_capacity_with_positive_maximum_is_unavailable() {
+        assert_capacity_normalizations(
+            "<key>AppleRawMaxCapacity</key><integer>5000</integer>
+            <key>BatteryData</key><dict>
+                <key>FullChargeCapacity</key><integer>8322</integer>
+                <key>DesignCapacity</key><integer>8694</integer>
+            </dict>",
+            Some((Some(8322), Some(8694), None)),
+            (None, 8322, 8694, 73.),
+        );
     }
 
     #[test]
@@ -402,7 +414,7 @@ mod tests {
                 </dict>"
             ),
             Some((Some(0), Some(0), Some(0))),
-            (0, 5000, 6000, 0.),
+            (Some(0), 5000, 6000, 0.),
         );
     }
 
@@ -417,7 +429,7 @@ mod tests {
                 </dict>"
             ),
             Some((Some(-8322), Some(-8694), Some(-7623))),
-            (4000, 5000, 6000, 80.),
+            (Some(4000), 5000, 6000, 80.),
         );
     }
 
@@ -430,7 +442,7 @@ mod tests {
                 <key>RemainingCapacity</key><integer>7623</integer>
             </dict>",
             Some((None, Some(8694), Some(7623))),
-            (7623, 0, 8694, 73.),
+            (Some(7623), 0, 8694, 73.),
         );
     }
 
@@ -446,7 +458,7 @@ mod tests {
                     </dict>"
                 ),
                 Some((Some(-8322), None, Some(7623))),
-                (7623, max, 0, 73.),
+                (Some(7623), max, 0, 73.),
             );
         }
     }

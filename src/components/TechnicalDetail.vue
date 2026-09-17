@@ -12,10 +12,11 @@ const batteryHealth = computed(() => {
   return `${Math.min(power.value.maxCapacity / designCapacity * 100, 100).toFixed(1)}%`
 })
 const currentCapacity = computed(() => {
-  if (!hasMaxCapacity.value || !Number.isFinite(power.value.currentCapacity) || power.value.currentCapacity < 0)
+  const capacity = power.value.currentCapacity
+  if (capacity == null || !Number.isFinite(capacity) || capacity < 0)
     return '—'
 
-  return `${power.value.currentCapacity}mAh`
+  return `${capacity}mAh`
 })
 </script>
 
