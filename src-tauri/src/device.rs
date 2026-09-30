@@ -50,12 +50,16 @@ pub fn start_device_listener() -> mpsc::Receiver<DeviceMessage> {
         let tx = tx.clone();
 
         async_runtime::spawn(async move {
-            tx.send(DeviceMessage {
-                device,
-                action: info.action,
-            })
-            .await
-            .unwrap();
+            if tx
+                .send(DeviceMessage {
+                    device,
+                    action: info.action,
+                })
+                .await
+                .is_err()
+            {
+                log::error!("failed to queue device message");
+            }
             mem::forget(tx);
         });
     }
@@ -93,7 +97,11 @@ pub fn start_device_sender(handle: AppHandle) -> async_runtime::JoinHandle<()> {
                             Ok(res) => DevicePowerTickEvent {
                                 udid: device.udid.clone(),
                                 data: NormalizedResource::from(&res),
-                            }.emit(&handle).unwrap(),
+                            }
+                            .emit(&handle)
+                            .unwrap_or_else(|error| {
+                                log::error!("failed to emit device power telemetry: {error}")
+                            }),
                             Err(err) => {
                                 log::error!("Failed to get IORegistry: {err}");
                             }
@@ -103,8 +111,10 @@ pub fn start_device_sender(handle: AppHandle) -> async_runtime::JoinHandle<()> {
                 Some(DeviceMessage { device, action }) = rx.recv() => {
                     match action {
                         Action::Attached => {
-                            // unwrap pair
-                            device.prepare_device().unwrap();
+                            if let Err(error) = device.prepare_device() {
+                                log::error!("failed to prepare device {}: {error}", device.udid);
+                                continue;
+                            }
                             let conn = device.start_service("com.apple.mobile.diagnostics_relay");
 
                             DeviceEvent {
@@ -114,7 +124,11 @@ pub fn start_device_sender(handle: AppHandle) -> async_runtime::JoinHandle<()> {
                                 name: device.name(),
                                 interface: device.interface_type,
                                 action,
-                            }.emit(&handle).unwrap();
+                            }
+                            .emit(&handle)
+                            .unwrap_or_else(|error| {
+                                log::error!("failed to emit device event: {error}")
+                            });
 
                             devices.insert(device, conn);
                         },
@@ -125,7 +139,11 @@ pub fn start_device_sender(handle: AppHandle) -> async_runtime::JoinHandle<()> {
                                 name: String::new(),
                                 interface: device.interface_type,
                                 action,
-                            }.emit(&handle).unwrap();
+                            }
+                            .emit(&handle)
+                            .unwrap_or_else(|error| {
+                                log::error!("failed to emit device event: {error}")
+                            });
                             devices.remove(&device);
                         },
                         _ => ()

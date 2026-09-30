@@ -37,7 +37,7 @@ pub struct NormalizedResource {
     pub last_update: i64,
     pub adapter_name: Option<String>,
     pub cycle_count: i32,
-    pub current_capacity: i32,
+    pub current_capacity: Option<i32>,
     pub max_capacity: i32,
     #[serde(default)]
     pub design_capacity: i32,
@@ -119,8 +119,46 @@ impl Deref for NormalizedResource {
     }
 }
 
+struct ResolvedCapacities {
+    current: Option<i32>,
+    max: i32,
+    design: i32,
+    percentage: f32,
+}
+
+fn resolved_capacities(io: &IORegistry) -> ResolvedCapacities {
+    let battery = io.battery_data.as_ref();
+    let current = battery
+        .and_then(|data| data.remaining_capacity)
+        .filter(|&capacity| capacity >= 0)
+        .or(io
+            .apple_raw_current_capacity
+            .filter(|&capacity| capacity >= 0));
+    let max = battery
+        .and_then(|data| data.full_charge_capacity)
+        .filter(|&capacity| capacity > 0)
+        .unwrap_or(io.apple_raw_max_capacity);
+    let design = battery
+        .and_then(|data| data.design_capacity)
+        .filter(|&capacity| capacity > 0)
+        .unwrap_or(io.design_capacity);
+    let percentage = match current {
+        Some(current) if max > current => current as f32 / max as f32 * 100.,
+        _ => io.current_capacity as f32,
+    }
+    .clamp(0., 100.);
+
+    ResolvedCapacities {
+        current,
+        max,
+        design,
+        percentage,
+    }
+}
+
 impl From<&IORegistry> for NormalizedResource {
     fn from(io: &IORegistry) -> Self {
+        let capacities = resolved_capacities(io);
         let (system_in, system_load, battery_power, adapter_power, efficiency_loss) =
             if let Some(d) = io.ptd() {
                 (
@@ -145,9 +183,9 @@ impl From<&IORegistry> for NormalizedResource {
                 .clone()
                 .or_else(|| io.adapter_details.description.clone()),
             cycle_count: io.cycle_count,
-            max_capacity: io.apple_raw_max_capacity,
-            design_capacity: io.design_capacity,
-            current_capacity: io.apple_raw_current_capacity,
+            max_capacity: capacities.max,
+            design_capacity: capacities.design,
+            current_capacity: capacities.current,
             data: NormalizedData {
                 system_in,
                 system_load,
@@ -157,9 +195,7 @@ impl From<&IORegistry> for NormalizedResource {
                 brightness_power: 0.,
                 heatpipe_power: 0.,
                 battery_level: io.current_capacity,
-                absolute_battery_level: io.apple_raw_current_capacity as f32
-                    / io.apple_raw_max_capacity as f32
-                    * 100.,
+                absolute_battery_level: capacities.percentage,
                 temperature: io.temperature as f32 / 100.,
 
                 adapter_watts: io.adapter_details.watts.unwrap_or_default() as f32,
@@ -173,6 +209,8 @@ impl From<&IORegistry> for NormalizedResource {
 
 impl From<(&IORegistry, &SMCPowerData)> for NormalizedResource {
     fn from((io, smc): (&IORegistry, &SMCPowerData)) -> Self {
+        let capacities = resolved_capacities(io);
+
         Self {
             is_local: true,
             last_update: io.update_time,
@@ -190,9 +228,9 @@ impl From<(&IORegistry, &SMCPowerData)> for NormalizedResource {
                 .clone()
                 .or_else(|| io.adapter_details.description.clone()),
             cycle_count: io.cycle_count,
-            max_capacity: io.apple_raw_max_capacity,
-            design_capacity: io.design_capacity,
-            current_capacity: io.apple_raw_current_capacity,
+            max_capacity: capacities.max,
+            design_capacity: capacities.design,
+            current_capacity: capacities.current,
             data: NormalizedData {
                 system_in: smc.delivery_rate,
                 system_load: smc.system_total,
@@ -203,9 +241,7 @@ impl From<(&IORegistry, &SMCPowerData)> for NormalizedResource {
                 brightness_power: smc.brightness,
                 heatpipe_power: smc.heatpipe,
                 battery_level: io.current_capacity,
-                absolute_battery_level: io.apple_raw_current_capacity as f32
-                    / io.apple_raw_max_capacity as f32
-                    * 100.,
+                absolute_battery_level: capacities.percentage,
                 temperature: smc.temperature,
                 adapter_power: smc.delivery_rate
                     + io.ptd()
@@ -242,7 +278,276 @@ pub fn get_mac_ioreg_dict() -> anyhow::Result<CFDictionary> {
 
 pub fn get_mac_ioreg() -> anyhow::Result<IORegistry> {
     let dic = get_mac_ioreg_dict()?;
-    unsafe { mem::transmute(dict_into::<repr::IORegistry>(dic)) }
+    parse_mac_ioreg(dic)
+}
+
+fn parse_mac_ioreg(dic: CFDictionary) -> anyhow::Result<IORegistry> {
+    Ok(dict_into::<repr::IORegistry>(dic)?.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{de::BatteryData, util::DictParseError};
+
+    #[test]
+    fn malformed_registry_returns_a_formattable_error() {
+        let dictionary = crate::cfdic! { "Voltage" = "invalid" }.to_untyped();
+        let error = parse_mac_ioreg(dictionary).unwrap_err();
+        assert!(error.downcast_ref::<DictParseError>().is_some());
+        assert!(format!("{error:?}").contains("Failed to parse plist"));
+    }
+
+    fn assert_capacity_normalizations(
+        entries: &str,
+        nested: Option<(Option<i32>, Option<i32>, Option<i32>)>,
+        expected: (Option<i32>, i32, i32, f32),
+    ) {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><dict>
+                <key>CurrentCapacity</key><integer>73</integer>
+                {entries}
+            </dict></plist>"#
+        );
+        let source: repr::IORegistry = plist::from_bytes(xml.as_bytes()).unwrap();
+        assert_eq!(
+            source.battery_data.as_ref().map(|data| (
+                data.full_charge_capacity,
+                data.design_capacity,
+                data.remaining_capacity,
+            )),
+            nested
+        );
+        let io = IORegistry::from(source);
+        assert_eq!(
+            io.battery_data.as_ref().map(|data| (
+                data.full_charge_capacity,
+                data.design_capacity,
+                data.remaining_capacity,
+            )),
+            nested
+        );
+        let smc = SMCPowerData::default();
+        for normalized in [
+            NormalizedResource::from(&io),
+            NormalizedResource::from((&io, &smc)),
+        ] {
+            assert_eq!(normalized.current_capacity, expected.0);
+            assert_eq!(normalized.max_capacity, expected.1);
+            assert_eq!(normalized.design_capacity, expected.2);
+            assert_eq!(normalized.battery_level, 73);
+            assert!((normalized.absolute_battery_level - expected.3).abs() < 0.0001);
+        }
+    }
+
+    const LEGACY_CAPACITIES: &str = "
+        <key>AppleRawCurrentCapacity</key><integer>4000</integer>
+        <key>AppleRawMaxCapacity</key><integer>5000</integer>
+        <key>DesignCapacity</key><integer>6000</integer>";
+
+    #[test]
+    fn macos27_nested_capacities_without_raw_root() {
+        assert_capacity_normalizations(
+            "<key>BatteryData</key><dict>
+                <key>FullChargeCapacity</key><integer>8322</integer>
+                <key>DesignCapacity</key><integer>8694</integer>
+                <key>RemainingCapacity</key><integer>7623</integer>
+                <key>NominalChargeCapacity</key><integer>8200</integer>
+            </dict>",
+            Some((Some(8322), Some(8694), Some(7623))),
+            (Some(7623), 8322, 8694, 7623. / 8322. * 100.),
+        );
+    }
+
+    #[test]
+    fn legacy_capacities_without_battery_data() {
+        assert_capacity_normalizations(LEGACY_CAPACITIES, None, (Some(4000), 5000, 6000, 80.));
+    }
+
+    #[test]
+    fn partial_nested_capacities_resolve_independently() {
+        for (entries, nested, expected) in [
+            (
+                "<key>FullChargeCapacity</key><integer>8322</integer>",
+                (Some(8322), None, None),
+                (Some(4000), 8322, 6000, 4000. / 8322. * 100.),
+            ),
+            (
+                "<key>DesignCapacity</key><integer>8694</integer>",
+                (None, Some(8694), None),
+                (Some(4000), 5000, 8694, 80.),
+            ),
+            (
+                "<key>RemainingCapacity</key><integer>7623</integer>",
+                (None, None, Some(7623)),
+                (Some(7623), 5000, 6000, 73.),
+            ),
+            ("", (None, None, None), (Some(4000), 5000, 6000, 80.)),
+        ] {
+            assert_capacity_normalizations(
+                &format!("{LEGACY_CAPACITIES}<key>BatteryData</key><dict>{entries}</dict>"),
+                Some(nested),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn missing_current_capacity_with_positive_maximum_is_unavailable() {
+        assert_capacity_normalizations(
+            "<key>AppleRawMaxCapacity</key><integer>5000</integer>
+            <key>BatteryData</key><dict>
+                <key>FullChargeCapacity</key><integer>8322</integer>
+                <key>DesignCapacity</key><integer>8694</integer>
+            </dict>",
+            Some((Some(8322), Some(8694), None)),
+            (None, 8322, 8694, 73.),
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_zero_capacity_is_preserved() {
+        assert_capacity_normalizations(
+            "<key>AppleRawCurrentCapacity</key><integer>0</integer>
+             <key>AppleRawMaxCapacity</key><integer>5000</integer>",
+            None,
+            (Some(0), 5000, 0, 0.),
+        );
+    }
+
+    #[test]
+    fn missing_or_negative_legacy_current_capacity_is_unavailable() {
+        for entries in [
+            "",
+            "<key>AppleRawCurrentCapacity</key><integer>-1</integer>",
+        ] {
+            assert_capacity_normalizations(
+                &format!("<key>AppleRawMaxCapacity</key><integer>5000</integer>{entries}"),
+                None,
+                (None, 5000, 0, 73.),
+            );
+        }
+    }
+
+    #[test]
+    fn zero_remaining_capacity_overrides_legacy_current() {
+        assert_capacity_normalizations(
+            &format!(
+                "{LEGACY_CAPACITIES}<key>BatteryData</key><dict>
+                    <key>FullChargeCapacity</key><integer>0</integer>
+                    <key>DesignCapacity</key><integer>0</integer>
+                    <key>RemainingCapacity</key><integer>0</integer>
+                </dict>"
+            ),
+            Some((Some(0), Some(0), Some(0))),
+            (Some(0), 5000, 6000, 0.),
+        );
+    }
+
+    #[test]
+    fn negative_nested_capacities_fall_back_to_legacy() {
+        assert_capacity_normalizations(
+            &format!(
+                "{LEGACY_CAPACITIES}<key>BatteryData</key><dict>
+                    <key>FullChargeCapacity</key><integer>-8322</integer>
+                    <key>DesignCapacity</key><integer>-8694</integer>
+                    <key>RemainingCapacity</key><integer>-7623</integer>
+                </dict>"
+            ),
+            Some((Some(-8322), Some(-8694), Some(-7623))),
+            (Some(4000), 5000, 6000, 80.),
+        );
+    }
+
+    #[test]
+    fn nominal_charge_capacity_is_not_a_maximum() {
+        assert_capacity_normalizations(
+            "<key>BatteryData</key><dict>
+                <key>NominalChargeCapacity</key><integer>8322</integer>
+                <key>DesignCapacity</key><integer>8694</integer>
+                <key>RemainingCapacity</key><integer>7623</integer>
+            </dict>",
+            Some((None, Some(8694), Some(7623))),
+            (Some(7623), 0, 8694, 73.),
+        );
+    }
+
+    #[test]
+    fn nonpositive_resolved_maximum_uses_reported_percentage() {
+        for max in [0, -5000] {
+            assert_capacity_normalizations(
+                &format!(
+                    "<key>AppleRawMaxCapacity</key><integer>{max}</integer>
+                    <key>BatteryData</key><dict>
+                        <key>FullChargeCapacity</key><integer>-8322</integer>
+                        <key>RemainingCapacity</key><integer>7623</integer>
+                    </dict>"
+                ),
+                Some((Some(-8322), None, Some(7623))),
+                (Some(7623), max, 0, 73.),
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_below_current_charge_uses_reported_percentage() {
+        for nested_max in ["", "<key>FullChargeCapacity</key><integer>5000</integer>"] {
+            assert_capacity_normalizations(
+                &format!(
+                    "{LEGACY_CAPACITIES}<key>BatteryData</key><dict>
+                        <key>RemainingCapacity</key><integer>7623</integer>
+                        {nested_max}
+                    </dict>"
+                ),
+                Some(((!nested_max.is_empty()).then_some(5000), None, Some(7623))),
+                (Some(7623), 5000, 6000, 73.),
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_percentage_is_bounded_by_one_hundred() {
+        for (current, max, expected) in [
+            (Some(7623), 5000, 73.),
+            (Some(4000), 5000, 80.),
+            (Some(5000), 5000, 73.),
+            (Some(7623), 8322, 7623. / 8322. * 100.),
+        ] {
+            let io = IORegistry {
+                current_capacity: 73,
+                apple_raw_current_capacity: None,
+                apple_raw_max_capacity: max,
+                battery_data: Some(BatteryData {
+                    remaining_capacity: current,
+                    full_charge_capacity: None,
+                    design_capacity: None,
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                NormalizedResource::from(&io).absolute_battery_level,
+                expected
+            );
+            assert_eq!(
+                NormalizedResource::from((&io, &SMCPowerData::default())).absolute_battery_level,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn missing_raw_capacity_uses_reported_battery_percentage() {
+        let io = IORegistry {
+            current_capacity: 73,
+            ..Default::default()
+        };
+        assert_eq!(NormalizedResource::from(&io).absolute_battery_level, 73.);
+        assert_eq!(
+            NormalizedResource::from((&io, &SMCPowerData::default())).absolute_battery_level,
+            73.
+        );
+    }
 }
 
 #[derive(Debug)]
