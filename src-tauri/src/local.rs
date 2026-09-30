@@ -75,7 +75,13 @@ pub fn start_sender<R: Runtime>(
     mut rx: mpsc::Receiver<SenderMessage>,
 ) -> async_runtime::JoinHandle<()> {
     let app = app.app_handle().clone();
-    let mut smc_conn = SMCConnection::new("AppleSMC").unwrap();
+    let mut smc_conn = match SMCConnection::new("AppleSMC") {
+        Ok(conn) => conn,
+        Err(error) => {
+            log::error!("failed to connect to AppleSMC (kern error {error}), telemetry disabled");
+            return async_runtime::spawn(async {});
+        }
+    };
 
     let mut timer = time::interval(Duration::from_millis(
         app.pinia()
@@ -145,7 +151,9 @@ pub fn setup_sender_with_events<R: Runtime>(app: &impl Manager<R>) {
     WindowLoadedEvent::listen(app, move |_| {
         let tx = tx.clone();
         async_runtime::spawn(async move {
-            tx.send(SenderMessage::ImmediateSend).await.unwrap();
+            tx.send(SenderMessage::ImmediateSend)
+                .await
+                .unwrap_or_else(|error| log::error!("power sender is gone: {error}"));
         });
     });
 
@@ -167,7 +175,9 @@ pub fn setup_sender_with_events<R: Runtime>(app: &impl Manager<R>) {
         } {
             let tx = tx.clone();
             async_runtime::spawn(async move {
-                tx.send(msg).await.unwrap();
+                tx.send(msg)
+                    .await
+                    .unwrap_or_else(|error| log::error!("power sender is gone: {error}"));
             });
         }
     });
