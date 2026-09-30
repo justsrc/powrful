@@ -143,9 +143,10 @@ fn resolved_capacities(io: &IORegistry) -> ResolvedCapacities {
         .filter(|&capacity| capacity > 0)
         .unwrap_or(io.design_capacity);
     let percentage = match current {
-        Some(current) if max > 0 => current as f32 / max as f32 * 100.,
+        Some(current) if max > current => current as f32 / max as f32 * 100.,
         _ => io.current_capacity as f32,
-    };
+    }
+    .clamp(0., 100.);
 
     ResolvedCapacities {
         current,
@@ -287,7 +288,7 @@ fn parse_mac_ioreg(dic: CFDictionary) -> anyhow::Result<IORegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::DictParseError;
+    use crate::{de::BatteryData, util::DictParseError};
 
     #[test]
     fn malformed_registry_returns_a_formattable_error() {
@@ -380,7 +381,7 @@ mod tests {
             (
                 "<key>RemainingCapacity</key><integer>7623</integer>",
                 (None, None, Some(7623)),
-                (Some(7623), 5000, 6000, 7623. / 5000. * 100.),
+                (Some(7623), 5000, 6000, 73.),
             ),
             ("", (None, None, None), (Some(4000), 5000, 6000, 80.)),
         ] {
@@ -485,6 +486,52 @@ mod tests {
                 ),
                 Some((Some(-8322), None, Some(7623))),
                 (Some(7623), max, 0, 73.),
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_below_current_charge_uses_reported_percentage() {
+        for nested_max in ["", "<key>FullChargeCapacity</key><integer>5000</integer>"] {
+            assert_capacity_normalizations(
+                &format!(
+                    "{LEGACY_CAPACITIES}<key>BatteryData</key><dict>
+                        <key>RemainingCapacity</key><integer>7623</integer>
+                        {nested_max}
+                    </dict>"
+                ),
+                Some(((!nested_max.is_empty()).then_some(5000), None, Some(7623))),
+                (Some(7623), 5000, 6000, 73.),
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_percentage_is_bounded_by_one_hundred() {
+        for (current, max, expected) in [
+            (Some(7623), 5000, 73.),
+            (Some(4000), 5000, 80.),
+            (Some(5000), 5000, 73.),
+            (Some(7623), 8322, 7623. / 8322. * 100.),
+        ] {
+            let io = IORegistry {
+                current_capacity: 73,
+                apple_raw_current_capacity: None,
+                apple_raw_max_capacity: max,
+                battery_data: Some(BatteryData {
+                    remaining_capacity: current,
+                    full_charge_capacity: None,
+                    design_capacity: None,
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                NormalizedResource::from(&io).absolute_battery_level,
+                expected
+            );
+            assert_eq!(
+                NormalizedResource::from((&io, &SMCPowerData::default())).absolute_battery_level,
+                expected
             );
         }
     }
